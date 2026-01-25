@@ -1,0 +1,541 @@
+
+
+```{r}
+#Main loader block
+library(DESeq2)
+library(pheatmap)
+library(RColorBrewer)
+library(dplyr)
+library(tidyr)
+library(ontologyIndex)
+library(tibble)
+library(ggplot2)
+library(ggtext)
+library(ggrepel)
+library(tibble)
+library(readxl)
+
+source("util_functions.R", local=TRUE)$value
+
+```
+
+
+Removing samples with SRRxxx identifiers from the counts matrix. These samples are excluded from the clustering analysis but retained for downstream differential expression analysis once cluster assignments have been determined.
+```{r}
+data <- read.table('C1_ATCC_counts.tab',header=T,row.names=1,sep='\t',check.names=F,quote='')
+data <- data[, 1:89]
+
+```
+
+Computing normalized counts using DESeq and converting them to FPKM values. Clustering is performed on the FPKM matrix
+```{r}
+mm <- data.frame(row.names=colnames(data),condition=colnames(data),type="paired-end")
+dds <- DESeqDataSetFromMatrix(countData=data,
+                                  colData=mm,
+                                  design=~condition)
+dds <- estimateSizeFactors(dds)
+
+genes <- read.table('C1_ATCC_genes.tab',header=T,row.names=1,sep='\t',check.names=F,quote='')
+genes = genes[rownames(data),,F]
+if ('Length' %in% colnames(genes)) {
+genes$Start = 1
+genes$End = genes$Start + genes$Length
+genes$Strand = '*'
+#genes$chr = 'chrom'
+} 
+genesGR <- GRanges(genes)
+rowRanges(dds) <- genesGR
+res_fpkm <- fpkm(dds)
+write.table(res_fpkm,'fpkm_counts.tab',quote=F,sep='\t')
+```
+
+#Loading the FPKM expression matrix and filtering out genes with low expression levels
+```{r}
+fpkm_counts <- read.table("fpkm_counts.tab", header = TRUE, sep = "\t", row.names = 1, check.names=F)
+dim(fpkm_counts)
+
+# Calculate the number of samples where the FPKM value is above the threshold for each gene
+num_samples_above_threshold <- rowSums(fpkm_counts > 10)
+# Filter out genes that don't have an FPKM above threshold in at least 20% of the samples
+min_samples <- 0.2 * ncol(fpkm_counts)
+fpkm_counts_filtered <- fpkm_counts[num_samples_above_threshold >= min_samples, ]
+
+dim(fpkm_counts_filtered)
+```
+
+#Assessment of Sample Variation Prior to Clustering
+```{r}
+# Compute correlation between samples
+sample_cor_filtered <- cor(fpkm_counts_filtered, method = 'spearman')
+
+# Define a fixed color scale
+breaks <- seq(-1, 1, length.out = 300)
+colors <- colorRampPalette(rev(brewer.pal(n = 7, name = "RdYlBu")))(length(breaks) - 1)
+# Heatmap
+png("heatmap.png", width = 3000, height = 4000, res = 400)
+pheatmap::pheatmap(as.matrix(sample_cor_filtered),
+         clustering_rows = FALSE,
+         clustering_cols = FALSE,
+         treeheight_row = 0,
+         treeheight_col = 0,
+         main = "Heatmap of the sample-to-sample correlations: C1",
+         show_colnames = FALSE,
+         show_rownames = FALSE,
+         color = colors,
+         breaks = breaks,
+         border_color = rgb(0, 0, 0, alpha = 0.1)
+         )
+dev.off()
+```
+
+
+Reading the GO annotation file from EggNOG and saving a cleaned version
+```{r}
+# Read the Excel file, skipping metadata rows
+df <- read_excel("out.emapper.annotations_C1.xlsx", skip = 2)
+
+# Extract gene IDs and GO annotations (1st and 10th columns)
+gene_go_df <- df[, c(1, 10)]
+colnames(gene_go_df) <- c("Gene", "annotation")
+
+gene_go_df <- gene_go_df[!is.na(gene_go_df$annotation) & gene_go_df$annotation != "-", ]
+gene_go_df$annotation <- gsub(",", " ", gene_go_df$annotation)
+write.table(gene_go_df, "GO_C1.tab", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+# Clustering Pipeline (Hierarchical)
+```{r}
+# === Define input data ===
+# Load expression data
+expression_data <- fpkm_counts_filtered
+# GO annotation data
+go_annotation <- "GO_C1.tab"
+
+# === Define cutoff points, transformations, and correlation methods ===
+cutoff_points <- seq(0.1, 1, by = 0.05)
+user_transformations <- c("sqrt")  # or c("none", "sqrt", "log")
+correlation_methods <- c("pearson", "spearman")
+# ======
+
+# Load GO data and parse the GO terms
+go_data <- read.table(go_annotation, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+go_data_long <- go_data %>%
+  dplyr::select(Gene = Gene, GO_Terms = annotation) %>%
+  separate_rows(GO_Terms, sep = " ")
+go_data_long$Gene <- as.character(go_data_long$Gene)
+
+all_genes <- row.names(expression_data) #including all genes for enrichment analysis, regardless of having GO annotation or not
+
+# Initialize result containers
+all_enrichment_tables <- list()
+results <- data.frame()
+cluster_assignments <- list()
+
+# Main loop over configurations
+for (correlation_method in correlation_methods) {
+  if (correlation_method == "spearman") {
+    transformation_names <- "none"
+  } else if (correlation_method == "pearson") {
+    transformation_names <- user_transformations
+  }
+  for (transformation_name in transformation_names) {
+    for (cutoff_point in cutoff_points) {
+      configuration <- paste("hierarchical", transformation_name, correlation_method, cutoff_point, sep = "_")
+      cat(sprintf("Processing: %s\n", configuration))
+      
+      # Applying transformation, and transposing the data for computing gene‑gene correlations
+      expression_data_t <- transformations[[transformation_name]](t(expression_data))
+      # Correlation and clustering
+      gene_cor <- cor(expression_data_t, method = correlation_method)
+      gene_dist <- as.dist(1 - gene_cor)
+      gene_hc <- hclust(gene_dist)
+      clusters <- cutree(gene_hc, h = cutoff_point)
+      
+      cluster_table <- data.frame(Gene = names(clusters), Cluster = as.vector(clusters))
+      #save cluster assignment for this configuration
+      cluster_assignments[[configuration]] <- cluster_table
+
+      # ✅ Call the Function to test the enrichment of a given clustering
+      out <- test_cluster_enrichment(cluster_table, go_data_long, configuration)
+      
+      # Append summary and full enrichment
+      results <- rbind(results, out$summary)
+      all_enrichment_tables[[length(all_enrichment_tables) + 1]] <- out$enrichment
+      
+    }
+  }
+}
+
+# === Combine All Enrichment Tables ===
+results_df <- as.data.frame(results)
+
+enrichment_tables <- dplyr::bind_rows(all_enrichment_tables)
+row.names(enrichment_tables) <- NULL
+# ===
+
+# Compute product (objective score)
+results_df$product <- ifelse(is.na(results_df$Mean_odds), 0,
+                             results_df$Mean_odds * results_df$Total_Clusters_With_More_Than_5_Genes)
+
+# find the max product and return its clustering
+best_idx     <- which.max(results_df$product)
+best_config  <- results_df$Configuration[best_idx]
+best_product <- results_df$product[best_idx]
+cat(sprintf("Best configuration: %s (product = %.4f)\n", best_config, best_product))
+
+# Retrieve the stored gene→cluster assignment for the best configuration
+best_cluster_assignment <- cluster_assignments[[best_config]]
+```
+
+hierarchical visualization
+```{r}
+# product (Clustering Quality)
+results_parsed <- results_df %>%
+  separate(Configuration, into = c("Method", "Transformation", "Correlation", "Cutoff_Point"), sep = "_", fill = "right")
+
+max_row <- results_parsed[which.max(results_parsed$product), ]
+max_row$label <- paste0("Max: ", round(max_row$product, 2),
+                        " / Tf: ", max_row$Transformation,
+                        " / COR: ", max_row$Correlation,
+                        " / Cut: ", max_row$Cutoff_Point)
+
+results_parsed$Cutoff_Point <- as.numeric(results_parsed$Cutoff_Point)
+max_row$Cutoff_Point <- as.numeric(max_row$Cutoff_Point)
+
+p <- ggplot(results_parsed, aes(x = Cutoff_Point, y = product,
+                                color = Correlation, shape = Transformation)) +
+  geom_point(data = max_row, aes(x = Cutoff_Point, y = product),
+             inherit.aes = FALSE, color = "black", size = 3, shape = 8) +
+  geom_text_repel(data = max_row, aes(x = Cutoff_Point, y = product, label = label), inherit.aes = FALSE, color = "black", size = 3, fontface = "bold", nudge_y = 1000) +
+  geom_line(aes(group = interaction(Correlation, Transformation))) +
+  geom_point(size = 3) +
+  scale_shape_manual(values = c(0, 1, 2))  +
+  labs(
+    x = "**Cutoff Point**",
+    y = "**Clustering Quality**",
+    color = "Correlation",
+    shape = "Transformation"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(0.1, 1, by = 0.1)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.text  = element_text(face = "bold"),
+    axis.title.x = element_markdown(),
+    axis.title.y = element_markdown()
+  )
+ggsave("Cutoff_vs_Product.png", plot = p, width = 6, height = 4, dpi = 300)
+
+
+# mean odds ratio (Strength of Enrichment)
+max_or <- results_parsed[which.max(results_parsed$Mean_odds), ]
+max_or$label <- paste0("Max: ", round(max_or$Mean_odds, 2),
+                        " / Tf: ", max_or$Transformation,
+                        " / COR: ", max_or$Correlation,
+                        " / Cut: ", max_or$Cutoff_Point)
+
+OR <- ggplot(results_parsed, aes(x = Cutoff_Point, y = Mean_odds,
+                                color = Correlation, shape = Transformation)) +
+  geom_point(data = max_or, aes(x = Cutoff_Point, y = Mean_odds),
+             inherit.aes = FALSE, color = "black", size = 3, shape = 8) +
+  geom_text_repel(data = max_or, aes(x = Cutoff_Point, y = Mean_odds, label = label), inherit.aes = FALSE, color = "black", size = 3, fontface = "bold", nudge_y = 10) +
+  geom_line(aes(group = interaction(Correlation, Transformation))) +
+  geom_point(size = 3) +
+  scale_shape_manual(values = c(0, 1, 2))  +
+  labs(
+    x = "**Cutoff Point**",
+    y = "**Strength of Enrichment**",
+    color = "Correlation",
+    shape = "Transformation"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(0.1, 1, by = 0.1)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.text  = element_text(face = "bold"),
+    axis.title.x = element_markdown(),
+    axis.title.y = element_markdown()
+  )
+ggsave("Cutoff_vs_OR.png", plot = OR, width = 5.7, height = 3.7, dpi = 300)
+
+
+# clusters with ≥5 genes
+max_clusters <- results_parsed[which.max(results_parsed$Total_Clusters_With_More_Than_5_Genes), ]
+max_clusters$label <- paste0("Max: ", max_clusters$Total_Clusters_With_More_Than_5_Genes,
+                        " / Tf: ", max_clusters$Transformation,
+                        " / COR: ", max_clusters$Correlation,
+                        " / Cut: ", max_clusters$Cutoff_Point)
+
+C <- ggplot(results_parsed, aes(x = Cutoff_Point, y = Total_Clusters_With_More_Than_5_Genes,
+                                color = Correlation, shape = Transformation)) +
+  geom_point(data = max_clusters, aes(x = Cutoff_Point, y = Total_Clusters_With_More_Than_5_Genes), inherit.aes = FALSE, color = "black", size = 3, shape = 8) +
+  geom_text_repel(data = max_clusters, aes(x = Cutoff_Point, y = Total_Clusters_With_More_Than_5_Genes, label = label), inherit.aes = FALSE, color = "black", size = 3, fontface = "bold", nudge_y = 25) +
+  geom_line(aes(group = interaction(Correlation, Transformation))) +
+  geom_point(size = 3) +
+  scale_shape_manual(values = c(0, 1, 2))  +
+  labs(
+    x = "**Cutoff Point**",
+    y = "**Clusters ≥ 5**",
+    color = "Correlation",
+    shape = "Transformation"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  scale_x_continuous(breaks = seq(0.1, 1, by = 0.1)) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    legend.title = element_text(face = "bold"),
+    legend.text  = element_text(face = "bold"),
+    axis.title.x = element_markdown(),
+    axis.title.y = element_markdown()
+  )
+ggsave("Cutoff_vs_Cluster.png", plot = C, width = 5.7, height = 3.7, dpi = 300)
+
+```
+
+
+# GO enrichment results for optimal clustering
+```{r}
+# Keep only significant rows
+enrichment_tables <- enrichment_tables %>% filter(adj_pvalue < 0.05)
+# Filter enrichment for the chosen configuration
+best_enrichment <- enrichment_tables %>% filter(Configuration == best_config)
+
+# adding GO Description, Ontology, and Definition
+go_obo <- get_ontology("go.obo", extract_tags = "everything")
+best_enrichment$GO_Term <- trimws(best_enrichment$GO_Term)
+# Build reverse lookup for alt_ids -> primary IDs
+alt_id_map <- unlist(lapply(names(go_obo$alt_id), function(primary_id) {
+  setNames(rep(primary_id, length(go_obo$alt_id[[primary_id]])), go_obo$alt_id[[primary_id]])
+}))
+# Map GO terms to primary IDs when needed
+best_enrichment <- best_enrichment %>%
+  mutate(
+    GO_Term_Corrected = case_when(
+      GO_Term %in% names(go_obo$name) ~ GO_Term,
+      GO_Term %in% names(alt_id_map) ~ alt_id_map[GO_Term],
+      TRUE ~ NA_character_
+    )
+  )
+
+available_ids <- unique(na.omit(best_enrichment$GO_Term_Corrected))
+go_info <- tibble(
+  GO_Term_Corrected = available_ids
+) %>%
+  distinct(GO_Term_Corrected) %>%
+  mutate(
+    GO_Description = go_obo$name[GO_Term_Corrected],
+    GO_Ontology = go_obo$namespace[GO_Term_Corrected],
+    GO_Definition = go_obo$def[GO_Term_Corrected]
+  )
+# Merge metadata into original table
+final_enrichment <- best_enrichment %>%
+  left_join(go_info, by = "GO_Term_Corrected")
+
+print(final_enrichment)
+```
+
+
+#differential expression
+```{r}
+# Load raw counts data
+counts <- read.table('C1_ATCC_counts.tab',header=T,row.names=1,sep='\t',check.names=F,quote='')
+```
+
+Avicel vs Glucose
+```{r}
+# Create metadata
+metadata <- data.frame(
+  row.names = c("SRR30193268", "SRR30193269", "SRR30193270", 
+             "SRR30193271", "SRR30193272", "SRR30193273"),
+  sugar_source = c("Glucose", "Glucose", "Glucose", 
+                   "Avicel", "Avicel", "Avicel"),
+  replicate = c(3, 2, 1, 3, 2, 1)
+)
+
+filtered_counts <- counts[, colnames(counts) %in% row.names(metadata)]
+metadata$sugar_source <- factor(metadata$sugar_source)
+
+# --- DESeq setup ---
+# this should be true, rownames of coldata and column names of counts table should match
+all(rownames(metadata) %in% colnames(filtered_counts))
+
+# columns of the count matrix must match the rows of the metadata in the same order
+all(rownames(metadata) == colnames(filtered_counts))
+# If the line above is not TRUE, run this:
+# filtered_counts <- filtered_counts[, rownames(metadata)]
+
+dds <- DESeqDataSetFromMatrix(countData = filtered_counts,
+                              colData = metadata,
+                              design = ~ sugar_source)
+dds <- DESeq(dds)
+
+# contrast = c("factorName", "numeratorLevel", "denominatorLevel")
+# Get results: Group1 vs Group2 #log2(Group1/Group2)
+res <- results(dds, contrast = c("sugar_source", "Avicel", "Glucose"))
+
+DESeq2_results <- as.data.frame(res)
+
+```
+
+day 4 vs day 1
+```{r}
+metadata <- data.frame(
+  row.names = c("H27NLDSX3_104643-001-003_TGAGCTAG-GAACGGTT_L003", "H27WTDSX3_104643-001-003_TGAGCTAG-GAACGGTT_L002",
+                "H27NLDSX3_104643-001-006_TTCCAAGG-CTACAAGG_L003", 
+             "H27WTDSX3_104643-001-006_TTCCAAGG-CTACAAGG_L002"),
+  day = c("D1", "D1",
+               "D4", "D4"),
+  replicate = c(0, 1, 0, 1)
+)
+
+filtered_counts <- counts[, colnames(counts) %in% row.names(metadata)]
+metadata$day <- factor(metadata$day)
+
+all(rownames(metadata) %in% colnames(filtered_counts))
+all(rownames(metadata) == colnames(filtered_counts))
+filtered_counts <- filtered_counts[, rownames(metadata)]
+
+
+dds <- DESeqDataSetFromMatrix(countData = filtered_counts,
+                              colData = metadata,
+                              design = ~ day)
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("day", "D4", "D1"))
+DESeq2_results <- as.data.frame(res)
+```
+
+
+Plot for differential expression and cluster visualization
+```{r}
+# 1) Clean and classify DESeq2_results
+DESeq2_results <- DESeq2_results %>%
+  filter(!is.na(padj), !is.na(log2FoldChange)) %>%
+  mutate(
+    regulation_class = case_when(
+      log2FoldChange >  1 ~ "Upregulated (log2FC > 1)",
+      log2FoldChange < -1 ~ "Downregulated (log2FC < -1)",
+      TRUE                ~ "|log2FC| ≤ 1"
+    ),
+    alpha_class = if_else(padj < 0.05, "padj < 0.05 (solid)", "padj ≥ 0.05 (transparent)")
+  ) %>%
+  tibble::rownames_to_column("Gene")
+
+# Keep only clusters with more than 4 genes
+cluster_sizes <- table(best_cluster_assignment$Cluster)
+valid_clusters <- names(cluster_sizes[cluster_sizes >= 5])
+cluster_table <- subset(best_cluster_assignment, Cluster %in% valid_clusters)
+
+# 2) Merge with clusters
+DESeq2_results_cluster <- cluster_table %>%
+  inner_join(DESeq2_results, by = "Gene") %>%
+  arrange(Cluster)
+
+DESeq2_results_cluster$Cluster <- factor(
+  DESeq2_results_cluster$Cluster,
+  levels = unique(DESeq2_results_cluster$Cluster)
+)
+
+DESeq2_results_cluster$ClusterGroup <- cut(
+  as.numeric(factor(DESeq2_results_cluster$Cluster)),
+  breaks = 3
+)
+
+# 3)plot
+p <- ggplot(subset(DESeq2_results_cluster, baseMean > 50), aes(x = Cluster, y = log2FoldChange)) +
+  geom_point(
+  aes(color = regulation_class, alpha = alpha_class),
+  size = 2,
+  stroke = 0
+  ) +
+  scale_color_manual(
+    values = c(
+      "Upregulated (log2FC > 1)"    = "red",
+      "Downregulated (log2FC < -1)" = "blue",
+      "|log2FC| ≤ 1"                = "grey60"
+    ),
+    guide = guide_legend(nrow = 1)
+  ) +
+  scale_alpha_manual(
+    values = c("padj < 0.05 (solid)" = 1, "padj ≥ 0.05 (transparent)" = 0.3),
+    guide = guide_legend(nrow = 1)
+  ) +
+  labs(
+    title = "Differential Expression Analysis in C1: Avicel vs Glucose",
+    color = "Regulation",
+    alpha  = "padj"
+  ) +
+  facet_wrap(~ ClusterGroup, scales = "free_x", ncol = 1) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
+    legend.position = "bottom",
+    legend.title = element_text(size = 10),
+    legend.margin = margin(t = 6)
+  ) +
+  scale_y_continuous(breaks = seq(-20, 20, by = 2))+
+  geom_hline(yintercept = 0, linewidth = 0.1, color = "grey30")
+
+ggsave("my_facet_plot.png", plot = p, width = 11, height = 9.5, dpi = 500)
+```
+
+
+#k-means (optional)
+```{r eval=FALSE, include=FALSE}
+# === Define input data ===
+# Load expression data
+expression_data <-  fpkm_counts_filtered
+# GO annotation data
+go_annotation <-   "GO_C1.tab"
+
+# === Define parameters ===
+k_values <- seq(100, 4000, by = 200)
+# Log-transform the FPKM matrix
+log_expression <- log(expression_data + 1)
+# ======
+
+# Load GO data and parse the GO terms
+go_data <- read.table(go_annotation, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+go_data_long <- go_data %>%
+  dplyr::select(Gene = Gene, GO_Terms = annotation) %>%
+  separate_rows(GO_Terms, sep = " ")
+go_data_long$Gene <- as.character(go_data_long$Gene)
+
+all_genes <- row.names(expression_data) # including all genes for enrichment analysis, regardless of having GO annotation or not
+
+# Initialize result containers
+all_enrichment_tables <- list()
+results <- data.frame()
+
+# Main loop
+for (k in k_values) {
+  configuration <- paste("kmeans", k, sep = "_")
+  cat(sprintf("Processing: %s\n", configuration))
+  
+  # Apply k-means clustering
+  set.seed(777)  # For reproducibility
+  kmeans_result <- kmeans(log_expression, centers = k , nstart = 50, iter.max = 100)
+  # Cluster assignments
+  clusters_kmeans <- kmeans_result$cluster
+  cluster_table <- data.frame(Gene = rownames(log_expression), Cluster = as.vector(clusters_kmeans))
+  
+  # ✅ Call the Function to test the enrichment of a given clustering
+  out <- test_cluster_enrichment(cluster_table, go_data_long, configuration)
+      
+  # Append summary and full enrichment
+  results <- rbind(results, out$summary)
+  all_enrichment_tables[[length(all_enrichment_tables) + 1]] <- out$enrichment
+}
+
+# === Combine All Enrichment Tables ===
+results_kmeans <- as.data.frame(results)
+enrichment_tables_k <- dplyr::bind_rows(all_enrichment_tables)
+row.names(enrichment_tables_k) <- NULL
+```
